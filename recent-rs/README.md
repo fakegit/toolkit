@@ -55,6 +55,7 @@ Keys:
 
 - `Up`/`Down` or `j`/`k`: select an application's Jump List file
 - `PageUp`/`PageDown`: scroll the selected file's entries
+- `f`: toggle between all Jump List files and only error/empty files
 - `d`: delete the selected `.automaticDestinations-ms` file
 - `y`: confirm delete
 - `n` or `Esc`: cancel delete

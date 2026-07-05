@@ -120,9 +120,39 @@ struct TuiApp {
     entries: Vec<RecentEntry>,
     selected: usize,
     entry_scroll: u16,
+    filter: TuiFilter,
     confirm_delete: bool,
     message: Option<String>,
     should_quit: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TuiFilter {
+    All,
+    ErrorOrEmpty,
+}
+
+impl TuiFilter {
+    fn toggle(self) -> Self {
+        match self {
+            Self::All => Self::ErrorOrEmpty,
+            Self::ErrorOrEmpty => Self::All,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::ErrorOrEmpty => "Error/Empty",
+        }
+    }
+
+    fn matches(self, file: &JumpListFile) -> bool {
+        match self {
+            Self::All => true,
+            Self::ErrorOrEmpty => file.parse_error.is_some() || file.empty_reason.is_some(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -226,6 +256,7 @@ impl TuiApp {
             entries: Vec::new(),
             selected: 0,
             entry_scroll: 0,
+            filter: TuiFilter::All,
             confirm_delete: false,
             message: None,
             should_quit: false,
@@ -234,9 +265,7 @@ impl TuiApp {
 
     fn reload(&mut self) -> Result<()> {
         self.files = list_automatic_files(&self.dir, &self.app_map)?;
-        if self.selected >= self.files.len() {
-            self.selected = self.files.len().saturating_sub(1);
-        }
+        self.clamp_selection();
         self.entry_scroll = 0;
         self.load_selected_entries();
         Ok(())
@@ -244,7 +273,7 @@ impl TuiApp {
 
     fn load_selected_entries(&mut self) {
         self.entries.clear();
-        if let Some(file) = self.files.get(self.selected) {
+        if let Some(file) = self.selected_file() {
             match scan_automatic_file(&file.path, file.appid.clone(), file.application.clone()) {
                 Ok(entries) => self.entries = entries,
                 Err(err) => self.message = Some(format!("failed to parse {}: {err}", file.name)),
@@ -272,10 +301,11 @@ impl TuiApp {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Char('r') => self.reload()?,
             KeyCode::Char('d') => {
-                if self.files.get(self.selected).is_some() {
+                if self.selected_file().is_some() {
                     self.confirm_delete = true;
                 }
             }
+            KeyCode::Char('f') | KeyCode::Char('F') => self.toggle_filter(),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
             KeyCode::PageDown => self.scroll_entries(8),
@@ -286,10 +316,11 @@ impl TuiApp {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        if self.files.is_empty() {
+        let visible_len = self.visible_len();
+        if visible_len == 0 {
             return;
         }
-        let max = self.files.len() as isize - 1;
+        let max = visible_len as isize - 1;
         self.selected = (self.selected as isize + delta).clamp(0, max) as usize;
         self.entry_scroll = 0;
         self.message = None;
@@ -301,12 +332,55 @@ impl TuiApp {
     }
 
     fn delete_selected(&mut self) -> Result<()> {
-        let Some(file) = self.files.get(self.selected).cloned() else {
+        let Some(file) = self.selected_file().cloned() else {
             return Ok(());
         };
         fs::remove_file(&file.path).with_context(|| format!("delete {}", file.path.display()))?;
         self.message = Some(format!("deleted {}", file.name));
         self.reload()
+    }
+
+    fn toggle_filter(&mut self) {
+        self.filter = self.filter.toggle();
+        self.clamp_selection();
+        self.entry_scroll = 0;
+        self.message = Some(format!("filter: {}", self.filter.label()));
+        self.load_selected_entries();
+    }
+
+    fn selected_file(&self) -> Option<&JumpListFile> {
+        self.files
+            .iter()
+            .filter(|file| self.filter.matches(file))
+            .nth(self.selected)
+    }
+
+    fn visible_len(&self) -> usize {
+        self.files
+            .iter()
+            .filter(|file| self.filter.matches(file))
+            .count()
+    }
+
+    fn clamp_selection(&mut self) {
+        let visible_len = self.visible_len();
+        if self.selected >= visible_len {
+            self.selected = visible_len.saturating_sub(1);
+        }
+    }
+
+    fn counts(&self) -> (usize, usize, usize) {
+        let errors = self
+            .files
+            .iter()
+            .filter(|file| file.parse_error.is_some())
+            .count();
+        let empty = self
+            .files
+            .iter()
+            .filter(|file| file.empty_reason.is_some())
+            .count();
+        (self.files.len(), errors, empty)
     }
 }
 
@@ -337,23 +411,12 @@ fn draw_tui(frame: &mut Frame, app: &TuiApp) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
+            Constraint::Length(3),
             Constraint::Min(1),
             Constraint::Length(3),
         ])
         .split(frame.size());
-    let title = Line::from(vec![
-        Span::styled(
-            " recent-rs ",
-            Style::default().fg(Color::Black).bg(Color::Cyan),
-        ),
-        Span::raw(" Automatic Jump Lists"),
-        Span::styled(
-            format!("  {}", app.dir.display()),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(title), root[0]);
+    draw_header(frame, app, root[0]);
 
     let panes = Layout::default()
         .direction(Direction::Horizontal)
@@ -364,7 +427,7 @@ fn draw_tui(frame: &mut Frame, app: &TuiApp) {
     draw_entry_list(frame, app, panes[1]);
 
     let help = app.message.as_deref().unwrap_or(
-        "Up/Down/j/k select  PageUp/PageDown scroll entries  d delete selected file  r reload  q quit",
+        "j/k select  PgUp/PgDn scroll  f filter error/empty  d delete  r reload  q quit",
     );
     frame.render_widget(
         Paragraph::new(help)
@@ -382,10 +445,64 @@ fn draw_tui(frame: &mut Frame, app: &TuiApp) {
     }
 }
 
+fn draw_header(frame: &mut Frame, app: &TuiApp, area: Rect) {
+    let (total, errors, empty) = app.counts();
+    let visible = app.visible_len();
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                " recent-rs ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " Automatic Jump Lists ",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{} shown / {} total", visible, total),
+                Style::default().fg(Color::Gray),
+            ),
+            Span::raw("  "),
+            Span::styled(format!("ERR {errors}"), Style::default().fg(Color::Red)),
+            Span::raw("  "),
+            Span::styled(format!("EMPTY {empty}"), Style::default().fg(Color::Yellow)),
+            Span::raw("  "),
+            Span::styled(
+                format!("FILTER {}", app.filter.label()),
+                Style::default().fg(if app.filter == TuiFilter::All {
+                    Color::DarkGray
+                } else {
+                    Color::Cyan
+                }),
+            ),
+        ]),
+        Line::from(Span::styled(
+            truncate_display(
+                &app.dir.display().to_string(),
+                area.width.saturating_sub(4) as usize,
+            ),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).block(tui_block("Recent Inspector")),
+        area,
+    );
+}
+
 fn draw_file_list(frame: &mut Frame, app: &TuiApp, area: Rect) {
     let inner_width = area.width.saturating_sub(4) as usize;
-    let items = app
+    let visible_files = app
         .files
+        .iter()
+        .filter(|file| app.filter.matches(file))
+        .collect::<Vec<_>>();
+    let items = visible_files
         .iter()
         .enumerate()
         .map(|(idx, file)| {
@@ -403,11 +520,17 @@ fn draw_file_list(frame: &mut Frame, app: &TuiApp, area: Rect) {
                 Style::default().fg(Color::Green)
             };
             let status = if file.parse_error.is_some() {
-                ("ERR ", Style::default().fg(Color::Red))
+                (" ERR ", Style::default().fg(Color::Black).bg(Color::Red))
             } else if file.empty_reason.is_some() {
-                ("EMPTY", Style::default().fg(Color::Yellow))
+                (
+                    " EMPTY ",
+                    Style::default().fg(Color::Black).bg(Color::Yellow),
+                )
             } else {
-                ("OK  ", Style::default().fg(Color::DarkGray))
+                (
+                    " OK ",
+                    Style::default().fg(Color::Black).bg(Color::DarkGray),
+                )
             };
             ListItem::new(vec![
                 Line::from(vec![
@@ -423,6 +546,8 @@ fn draw_file_list(frame: &mut Frame, app: &TuiApp, area: Rect) {
                     ),
                 ]),
                 Line::from(vec![
+                    Span::styled(status.0, status.1.add_modifier(Modifier::BOLD)),
+                    Span::raw("  "),
                     Span::styled(format!("{:>3} entries", file.entry_count), count_style),
                     Span::raw("  "),
                     Span::styled(
@@ -430,22 +555,20 @@ fn draw_file_list(frame: &mut Frame, app: &TuiApp, area: Rect) {
                         Style::default().fg(Color::Gray),
                     ),
                 ]),
-                Line::from(vec![
-                    Span::styled(status.0, status.1),
-                    Span::styled(
-                        truncate_display(&file.name, inner_width.saturating_sub(4)),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]),
+                Line::from(vec![Span::styled(
+                    truncate_display(&file.name, inner_width),
+                    Style::default().fg(Color::DarkGray),
+                )]),
             ])
         })
         .collect::<Vec<_>>();
     let mut state = ListState::default();
-    if !app.files.is_empty() {
+    if !visible_files.is_empty() {
         state.select(Some(app.selected));
     }
+    let title = format!("Applications [{}]", app.filter.label());
     let list = List::new(items)
-        .block(tui_block("Applications"))
+        .block(tui_block(title).border_style(Style::default().fg(Color::Cyan)))
         .highlight_style(
             Style::default()
                 .fg(Color::Black)
@@ -456,7 +579,7 @@ fn draw_file_list(frame: &mut Frame, app: &TuiApp, area: Rect) {
 }
 
 fn draw_entry_list(frame: &mut Frame, app: &TuiApp, area: Rect) {
-    let selected = app.files.get(app.selected);
+    let selected = app.selected_file();
     let title = selected
         .map(|file| {
             format!(
@@ -509,6 +632,17 @@ fn draw_entry_list(frame: &mut Frame, app: &TuiApp, area: Rect) {
                         .unwrap_or("no Shell Link entries were found"),
                 ),
             ]),
+        ]
+    } else if app.visible_len() == 0 {
+        vec![
+            Line::from(Span::styled(
+                "No Jump List files match the current filter.",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from("Press f to return to the full list."),
         ]
     } else if app.entries.is_empty() {
         vec![
@@ -597,8 +731,7 @@ fn draw_entry_list(frame: &mut Frame, app: &TuiApp, area: Rect) {
 fn draw_delete_confirm(frame: &mut Frame, app: &TuiApp) {
     let area = centered_rect(62, 22, frame.size());
     let name = app
-        .files
-        .get(app.selected)
+        .selected_file()
         .map(|file| file.name.as_str())
         .unwrap_or("");
     frame.render_widget(Clear, area);
