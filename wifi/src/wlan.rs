@@ -40,8 +40,36 @@ mod imp {
         }
 
         pub fn current_profile(&self) -> Result<Option<WifiProfile>> {
-            let profiles = self.list_profiles()?;
-            Ok(profiles.into_iter().find(|profile| profile.is_current))
+            for interface in self.interfaces()? {
+                let Some(current_connection) = self.current_connection(&interface.guid)? else {
+                    continue;
+                };
+
+                if !current_connection.profile_name.is_empty() {
+                    return self
+                        .profile(
+                            &interface.guid,
+                            &interface.name,
+                            &current_connection.profile_name,
+                            Some(&current_connection),
+                        )
+                        .map(Some);
+                }
+
+                for profile_name in self.profile_names(&interface.guid)? {
+                    let profile = self.profile(
+                        &interface.guid,
+                        &interface.name,
+                        &profile_name,
+                        Some(&current_connection),
+                    )?;
+                    if profile.is_current {
+                        return Ok(Some(profile));
+                    }
+                }
+            }
+
+            Ok(None)
         }
 
         pub fn list_profiles(&self) -> Result<Vec<WifiProfile>> {
@@ -49,10 +77,15 @@ mod imp {
             let mut profiles = Vec::new();
 
             for interface in interfaces {
-                let current_ssid = self.current_ssid(&interface.guid)?;
+                let current_connection = self.current_connection(&interface.guid)?;
                 for profile_name in self.profile_names(&interface.guid)? {
                     let profile = self
-                        .profile(&interface.guid, &interface.name, &profile_name, current_ssid.as_deref())?;
+                        .profile(
+                            &interface.guid,
+                            &interface.name,
+                            &profile_name,
+                            current_connection.as_ref(),
+                        )?;
                     profiles.push(profile);
                 }
             }
@@ -88,7 +121,7 @@ mod imp {
                 .collect())
         }
 
-        fn current_ssid(&self, guid: &GUID) -> Result<Option<String>> {
+        fn current_connection(&self, guid: &GUID) -> Result<Option<CurrentConnection>> {
             let mut data_size = 0;
             let mut data_ptr: *mut c_void = null_mut();
             let mut opcode_value_type: WLAN_OPCODE_VALUE_TYPE = wlan_opcode_value_type_query_only;
@@ -115,11 +148,15 @@ mod imp {
             }
 
             let attributes = unsafe { &*(data_ptr.cast::<WLAN_CONNECTION_ATTRIBUTES>()) };
+            let profile_name = utf16_z(&attributes.strProfileName);
             let ssid = &attributes.wlanAssociationAttributes.dot11Ssid;
             let length = ssid.uSSIDLength as usize;
             let bytes = &ssid.ucSSID[..length.min(ssid.ucSSID.len())];
 
-            Ok(Some(String::from_utf8_lossy(bytes).into_owned()))
+            Ok(Some(CurrentConnection {
+                profile_name,
+                ssid: String::from_utf8_lossy(bytes).into_owned(),
+            }))
         }
 
         fn profile_names(&self, guid: &GUID) -> Result<Vec<String>> {
@@ -146,14 +183,17 @@ mod imp {
             guid: &GUID,
             interface_name: &str,
             profile_name: &str,
-            current_ssid: Option<&str>,
+            current_connection: Option<&CurrentConnection>,
         ) -> Result<WifiProfile> {
             let xml = self.profile_xml(guid, profile_name)?;
             let details = parse_profile_xml(&xml);
             let ssid = details.ssid.unwrap_or_else(|| profile_name.to_string());
+            let is_current = current_connection.is_some_and(|connection| {
+                connection.profile_name == profile_name || connection.ssid == ssid
+            });
 
             Ok(WifiProfile {
-                is_current: current_ssid == Some(ssid.as_str()),
+                is_current,
                 ssid,
                 interface_name: interface_name.to_string(),
                 auth_type: details.auth_type,
@@ -200,6 +240,11 @@ mod imp {
     struct Interface {
         guid: GUID,
         name: String,
+    }
+
+    struct CurrentConnection {
+        profile_name: String,
+        ssid: String,
     }
 
     struct WlanMemory(*mut c_void);

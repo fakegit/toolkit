@@ -43,7 +43,9 @@ pub fn run() -> Result<()> {
     })) {
         Command::Current(output) => {
             let Some(profile) = client.current_profile()? else {
-                bail!("no active Wi-Fi connection found");
+                bail!(
+                    "no active Wi-Fi connection found; if Wi-Fi is connected, enable Windows location access for this terminal/app so WLAN information can be read"
+                );
             };
             print_profiles(&[profile], &output)
         }
