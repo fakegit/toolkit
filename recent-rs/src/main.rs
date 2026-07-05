@@ -8,9 +8,11 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+};
 use ratatui::Frame;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -19,6 +21,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use walkdir::WalkDir;
 
 #[derive(Parser)]
@@ -106,6 +109,7 @@ struct JumpListFile {
     application: Option<String>,
     source_modified_utc: Option<String>,
     entry_count: usize,
+    empty_reason: Option<String>,
     parse_error: Option<String>,
 }
 
@@ -143,11 +147,32 @@ struct LnkInfo {
 }
 
 fn main() -> Result<()> {
+    configure_windows_utf8_console();
+
     let cli = Cli::parse();
     match cli.command {
         Command::Scan(args) => scan(args),
         Command::Tui(args) => tui(args),
     }
+}
+
+#[cfg(windows)]
+fn configure_windows_utf8_console() {
+    const CP_UTF8: u32 = 65001;
+    unsafe {
+        SetConsoleOutputCP(CP_UTF8);
+        SetConsoleCP(CP_UTF8);
+    }
+}
+
+#[cfg(not(windows))]
+fn configure_windows_utf8_console() {}
+
+#[cfg(windows)]
+#[link(name = "Kernel32")]
+extern "system" {
+    fn SetConsoleOutputCP(w_code_page_id: u32) -> i32;
+    fn SetConsoleCP(w_code_page_id: u32) -> i32;
 }
 
 fn tui(args: TuiArgs) -> Result<()> {
@@ -166,11 +191,14 @@ fn tui(args: TuiArgs) -> Result<()> {
     let mut app = TuiApp::new(input, app_map);
     let run_result = run_tui(&mut terminal, &mut app);
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    let cleanup_result = disable_raw_mode()
+        .map_err(anyhow::Error::from)
+        .and_then(|_| {
+            execute!(terminal.backend_mut(), LeaveAlternateScreen).map_err(anyhow::Error::from)
+        })
+        .and_then(|_| terminal.show_cursor().map_err(anyhow::Error::from));
 
-    run_result
+    run_result.and(cleanup_result)
 }
 
 fn run_tui<B: ratatui::backend::Backend>(
@@ -308,26 +336,45 @@ fn scan(args: ScanArgs) -> Result<()> {
 fn draw_tui(frame: &mut Frame, app: &TuiApp) {
     let root = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(3)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(3),
+        ])
         .split(frame.size());
+    let title = Line::from(vec![
+        Span::styled(
+            " recent-rs ",
+            Style::default().fg(Color::Black).bg(Color::Cyan),
+        ),
+        Span::raw(" Automatic Jump Lists"),
+        Span::styled(
+            format!("  {}", app.dir.display()),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(title), root[0]);
+
     let panes = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
-        .split(root[0]);
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .split(root[1]);
 
     draw_file_list(frame, app, panes[0]);
     draw_entry_list(frame, app, panes[1]);
 
     let help = app.message.as_deref().unwrap_or(
-        "Up/Down or j/k select  PageUp/PageDown scroll entries  d delete selected file  r reload  q quit",
+        "Up/Down/j/k select  PageUp/PageDown scroll entries  d delete selected file  r reload  q quit",
     );
     frame.render_widget(
-        Paragraph::new(help).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(app.dir.display().to_string()),
-        ),
-        root[1],
+        Paragraph::new(help)
+            .style(if app.message.is_some() {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            })
+            .block(tui_block("Status")),
+        root[2],
     );
 
     if app.confirm_delete {
@@ -336,33 +383,60 @@ fn draw_tui(frame: &mut Frame, app: &TuiApp) {
 }
 
 fn draw_file_list(frame: &mut Frame, app: &TuiApp, area: Rect) {
+    let inner_width = area.width.saturating_sub(4) as usize;
     let items = app
         .files
         .iter()
-        .map(|file| {
+        .enumerate()
+        .map(|(idx, file)| {
             let app_name = file
                 .application
                 .as_deref()
                 .or(file.appid.as_deref())
                 .unwrap_or("unknown app");
             let modified = file.source_modified_utc.as_deref().unwrap_or("");
-            let status = file
-                .parse_error
-                .as_ref()
-                .map(|_| " parse-error")
-                .unwrap_or("");
+            let count_style = if file.parse_error.is_some() {
+                Style::default().fg(Color::Red)
+            } else if file.empty_reason.is_some() {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Green)
+            };
+            let status = if file.parse_error.is_some() {
+                ("ERR ", Style::default().fg(Color::Red))
+            } else if file.empty_reason.is_some() {
+                ("EMPTY", Style::default().fg(Color::Yellow))
+            } else {
+                ("OK  ", Style::default().fg(Color::DarkGray))
+            };
             ListItem::new(vec![
-                Line::from(Span::styled(
-                    truncate(app_name, 38),
-                    Style::default().add_modifier(Modifier::BOLD),
-                )),
-                Line::from(format!(
-                    "{} entries | {}{}",
-                    file.entry_count,
-                    truncate(modified, 24),
-                    status
-                )),
-                Line::from(truncate(&file.name, 44)),
+                Line::from(vec![
+                    Span::styled(
+                        format!("{:>3} ", idx + 1),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        truncate_display(app_name, inner_width.saturating_sub(4)),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled(format!("{:>3} entries", file.entry_count), count_style),
+                    Span::raw("  "),
+                    Span::styled(
+                        truncate_display(modified, 20),
+                        Style::default().fg(Color::Gray),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled(status.0, status.1),
+                    Span::styled(
+                        truncate_display(&file.name, inner_width.saturating_sub(4)),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]),
             ])
         })
         .collect::<Vec<_>>();
@@ -371,8 +445,13 @@ fn draw_file_list(frame: &mut Frame, app: &TuiApp, area: Rect) {
         state.select(Some(app.selected));
     }
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Applications"))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        .block(tui_block("Applications"))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -389,10 +468,59 @@ fn draw_entry_list(frame: &mut Frame, app: &TuiApp, area: Rect) {
             )
         })
         .unwrap_or_else(|| "Entries".to_string());
-    let lines = if app.entries.is_empty() {
-        vec![Line::from(
-            "No entries, or selected file could not be parsed.",
-        )]
+    let inner_width = area.width.saturating_sub(4) as usize;
+    let lines = if let Some(file) = selected.filter(|file| file.parse_error.is_some()) {
+        vec![
+            Line::from(Span::styled(
+                "This Jump List file could not be parsed.",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("File: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(truncate_display(&file.name, inner_width.saturating_sub(6))),
+            ]),
+            Line::from(vec![
+                Span::styled("Reason: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    file.parse_error.as_deref().unwrap_or("unknown parse error"),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]),
+        ]
+    } else if let Some(file) = selected.filter(|file| file.empty_reason.is_some()) {
+        vec![
+            Line::from(Span::styled(
+                "This Jump List file was read successfully, but no entries were extracted.",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("File: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(truncate_display(&file.name, inner_width.saturating_sub(6))),
+            ]),
+            Line::from(vec![
+                Span::styled("Reason: ", Style::default().fg(Color::DarkGray)),
+                Span::raw(
+                    file.empty_reason
+                        .as_deref()
+                        .unwrap_or("no Shell Link entries were found"),
+                ),
+            ]),
+        ]
+    } else if app.entries.is_empty() {
+        vec![
+            Line::from(Span::styled(
+                "No entries found in the selected Jump List.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+            Line::from(
+                "The file may be empty, or it may not contain hexadecimal Shell Link streams.",
+            ),
+        ]
     } else {
         app.entries
             .iter()
@@ -410,34 +538,56 @@ fn draw_entry_list(frame: &mut Frame, app: &TuiApp, area: Rect) {
                     .or(entry.relative_path.as_deref())
                     .unwrap_or("");
                 let stream = entry.stream_name.as_deref().unwrap_or("");
-                let error = entry
-                    .parse_error
-                    .as_ref()
-                    .map(|err| format!(" | parse: {err}"))
-                    .unwrap_or_default();
-                [
+                let status = entry.parse_error.as_deref();
+                let target = if target.is_empty() {
+                    "(no target path decoded)"
+                } else {
+                    target
+                };
+                let mut lines = vec![
+                    Line::from(vec![
+                        Span::styled(
+                            format!("#{stream} "),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(modified, Style::default().fg(Color::Gray)),
+                    ]),
                     Line::from(Span::styled(
-                        format!("#{stream} {modified}"),
-                        Style::default().add_modifier(Modifier::BOLD),
+                        truncate_display(target, inner_width),
+                        Style::default().fg(if status.is_some() {
+                            Color::DarkGray
+                        } else {
+                            Color::White
+                        }),
                     )),
-                    Line::from(truncate(target, 120)),
-                    Line::from(format!(
-                        "host: {} | dest: {}{}",
-                        entry.destlist_hostname.as_deref().unwrap_or(""),
-                        entry
-                            .destlist_entry_number
-                            .map(|n| n.to_string())
-                            .unwrap_or_default(),
-                        error
-                    )),
-                    Line::from(""),
-                ]
+                    Line::from(vec![
+                        Span::styled("host ", Style::default().fg(Color::DarkGray)),
+                        Span::raw(entry.destlist_hostname.as_deref().unwrap_or("")),
+                        Span::styled("  dest ", Style::default().fg(Color::DarkGray)),
+                        Span::raw(
+                            entry
+                                .destlist_entry_number
+                                .map(|n| n.to_string())
+                                .unwrap_or_default(),
+                        ),
+                    ]),
+                ];
+                if let Some(err) = status {
+                    lines.push(Line::from(vec![
+                        Span::styled("parse error ", Style::default().fg(Color::Red)),
+                        Span::styled(err, Style::default().fg(Color::Yellow)),
+                    ]));
+                }
+                lines.extend([Line::from("")]);
+                lines
             })
             .collect::<Vec<_>>()
     };
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(title))
+            .block(tui_block(title))
             .scroll((app.entry_scroll, 0))
             .wrap(Wrap { trim: false }),
         area,
@@ -459,18 +609,25 @@ fn draw_delete_confirm(frame: &mut Frame, app: &TuiApp) {
                 Style::default().add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
-            Line::from(truncate(name, area.width.saturating_sub(4) as usize)),
+            Line::from(truncate_display(
+                name,
+                area.width.saturating_sub(4) as usize,
+            )),
             Line::from(""),
             Line::from("This removes that application's AutomaticDestinations file."),
             Line::from("Press y to delete, n or Esc to cancel."),
         ])
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Confirm Delete"),
-        ),
+        .block(tui_block("Confirm Delete")),
         area,
     );
+}
+
+fn tui_block<T: Into<String>>(title: T) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(title.into())
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -516,9 +673,14 @@ fn list_automatic_files(
         let application = appid.as_ref().and_then(|id| app_map.get(id).cloned());
         let meta = fs::metadata(path).ok();
         let parsed = scan_automatic_file(path, appid.clone(), application.clone());
-        let (entry_count, parse_error) = match parsed {
-            Ok(entries) => (entries.len(), None),
-            Err(err) => (0, Some(err.to_string())),
+        let (entry_count, empty_reason, parse_error) = match parsed {
+            Ok(entries) => {
+                let empty_reason = entries.is_empty().then(|| {
+                    "no hexadecimal Shell Link streams were found in the CFB container".to_string()
+                });
+                (entries.len(), empty_reason, None)
+            }
+            Err(err) => (0, None, Some(err.to_string())),
         };
         files.push(JumpListFile {
             path: path.to_path_buf(),
@@ -531,6 +693,7 @@ fn list_automatic_files(
             application,
             source_modified_utc: meta.and_then(|m| m.modified().ok()).map(system_time_to_utc),
             entry_count,
+            empty_reason,
             parse_error,
         });
     }
@@ -1112,6 +1275,29 @@ fn truncate(value: &str, width: usize) -> String {
     }
 }
 
+fn truncate_display(value: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(value) <= max_width {
+        return value.to_string();
+    }
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
+
+    let mut out = String::new();
+    let mut width = 0usize;
+    let ellipsis_width = 3usize;
+    for ch in value.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width + ellipsis_width > max_width {
+            break;
+        }
+        out.push(ch);
+        width += ch_width;
+    }
+    out.push_str("...");
+    out
+}
+
 fn read_lnk_string(data: &[u8], offset: usize, unicode: bool) -> Result<(String, usize)> {
     let chars = le_u16(data, offset)? as usize;
     let start = offset + 2;
@@ -1126,7 +1312,7 @@ fn read_lnk_string(data: &[u8], offset: usize, unicode: bool) -> Result<(String,
         if end > data.len() {
             bail!("StringData extends past end of file");
         }
-        Ok((String::from_utf8_lossy(&data[start..end]).to_string(), end))
+        Ok((decode_ansi_bytes(&data[start..end]), end))
     }
 }
 
@@ -1139,7 +1325,7 @@ fn read_c_string(data: &[u8], offset: usize, limit: usize) -> Option<String> {
         .position(|&b| b == 0)
         .map(|pos| offset + pos)
         .unwrap_or(limit.min(data.len()));
-    Some(String::from_utf8_lossy(&data[offset..end]).to_string())
+    Some(decode_ansi_bytes(&data[offset..end]))
 }
 
 fn read_utf16z(data: &[u8], offset: usize, limit: usize) -> Option<String> {
@@ -1162,6 +1348,16 @@ fn utf16_lossy(bytes: &[u8]) -> String {
         .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
         .collect::<Vec<_>>();
     String::from_utf16_lossy(&words)
+}
+
+fn decode_ansi_bytes(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(value) => value.to_string(),
+        Err(_) => {
+            let (decoded, _, _) = encoding_rs::GBK.decode(bytes);
+            decoded.into_owned()
+        }
+    }
 }
 
 fn ascii_fixed(data: &[u8], offset: usize, len: usize) -> Option<String> {
@@ -1307,6 +1503,19 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn decodes_non_utf8_lnk_strings_as_gbk() {
+        assert_eq!(decode_ansi_bytes(&[0xce, 0xc4, 0xb5, 0xb5]), "文档");
+    }
+
+    #[test]
+    fn truncates_by_terminal_display_width() {
+        let value = truncate_display("文档路径abcdef", 10);
+
+        assert!(UnicodeWidthStr::width(value.as_str()) <= 10);
+        assert_eq!(value, "文档路...");
     }
 
     fn destlist_v3(entry_number: u32, hostname: &str, path: &str) -> Vec<u8> {
