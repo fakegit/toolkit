@@ -1,6 +1,17 @@
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::Frame;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::env;
@@ -21,6 +32,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Scan(ScanArgs),
+    Tui(TuiArgs),
 }
 
 #[derive(Parser)]
@@ -42,6 +54,15 @@ struct ScanArgs {
 
     #[arg(long)]
     include_custom: bool,
+}
+
+#[derive(Parser)]
+struct TuiArgs {
+    #[arg(long, value_name = "PATH")]
+    dir: Option<PathBuf>,
+
+    #[arg(long, value_name = "CSV")]
+    appid_map: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -78,6 +99,29 @@ struct RecentEntry {
 }
 
 #[derive(Debug, Clone)]
+struct JumpListFile {
+    path: PathBuf,
+    name: String,
+    appid: Option<String>,
+    application: Option<String>,
+    source_modified_utc: Option<String>,
+    entry_count: usize,
+    parse_error: Option<String>,
+}
+
+struct TuiApp {
+    dir: PathBuf,
+    app_map: HashMap<String, String>,
+    files: Vec<JumpListFile>,
+    entries: Vec<RecentEntry>,
+    selected: usize,
+    entry_scroll: u16,
+    confirm_delete: bool,
+    message: Option<String>,
+    should_quit: bool,
+}
+
+#[derive(Debug, Clone)]
 struct DestListEntry {
     entry_number: u32,
     hostname: Option<String>,
@@ -102,6 +146,139 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Scan(args) => scan(args),
+        Command::Tui(args) => tui(args),
+    }
+}
+
+fn tui(args: TuiArgs) -> Result<()> {
+    let input = args.dir.unwrap_or(default_automatic_destinations_dir()?);
+    let mut app_map = builtin_appid_map();
+    if let Some(path) = &args.appid_map {
+        load_appid_map(path, &mut app_map)?;
+    }
+
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = ratatui::Terminal::new(backend)?;
+
+    let mut app = TuiApp::new(input, app_map);
+    let run_result = run_tui(&mut terminal, &mut app);
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    run_result
+}
+
+fn run_tui<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    app: &mut TuiApp,
+) -> Result<()> {
+    app.reload()?;
+    while !app.should_quit {
+        terminal.draw(|frame| draw_tui(frame, app))?;
+        if let Event::Key(key) = event::read()? {
+            if key.kind == KeyEventKind::Press {
+                app.handle_key(key.code)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+impl TuiApp {
+    fn new(dir: PathBuf, app_map: HashMap<String, String>) -> Self {
+        Self {
+            dir,
+            app_map,
+            files: Vec::new(),
+            entries: Vec::new(),
+            selected: 0,
+            entry_scroll: 0,
+            confirm_delete: false,
+            message: None,
+            should_quit: false,
+        }
+    }
+
+    fn reload(&mut self) -> Result<()> {
+        self.files = list_automatic_files(&self.dir, &self.app_map)?;
+        if self.selected >= self.files.len() {
+            self.selected = self.files.len().saturating_sub(1);
+        }
+        self.entry_scroll = 0;
+        self.load_selected_entries();
+        Ok(())
+    }
+
+    fn load_selected_entries(&mut self) {
+        self.entries.clear();
+        if let Some(file) = self.files.get(self.selected) {
+            match scan_automatic_file(&file.path, file.appid.clone(), file.application.clone()) {
+                Ok(entries) => self.entries = entries,
+                Err(err) => self.message = Some(format!("failed to parse {}: {err}", file.name)),
+            }
+        }
+    }
+
+    fn handle_key(&mut self, code: KeyCode) -> Result<()> {
+        if self.confirm_delete {
+            match code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.delete_selected()?;
+                    self.confirm_delete = false;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.confirm_delete = false;
+                    self.message = Some("delete cancelled".to_string());
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        match code {
+            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            KeyCode::Char('r') => self.reload()?,
+            KeyCode::Char('d') => {
+                if self.files.get(self.selected).is_some() {
+                    self.confirm_delete = true;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+            KeyCode::PageDown => self.scroll_entries(8),
+            KeyCode::PageUp => self.scroll_entries(-8),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.files.is_empty() {
+            return;
+        }
+        let max = self.files.len() as isize - 1;
+        self.selected = (self.selected as isize + delta).clamp(0, max) as usize;
+        self.entry_scroll = 0;
+        self.message = None;
+        self.load_selected_entries();
+    }
+
+    fn scroll_entries(&mut self, delta: isize) {
+        self.entry_scroll = (self.entry_scroll as isize + delta).max(0) as u16;
+    }
+
+    fn delete_selected(&mut self) -> Result<()> {
+        let Some(file) = self.files.get(self.selected).cloned() else {
+            return Ok(());
+        };
+        fs::remove_file(&file.path).with_context(|| format!("delete {}", file.path.display()))?;
+        self.message = Some(format!("deleted {}", file.name));
+        self.reload()
     }
 }
 
@@ -126,6 +303,244 @@ fn scan(args: ScanArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn draw_tui(frame: &mut Frame, app: &TuiApp) {
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(3)])
+        .split(frame.size());
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .split(root[0]);
+
+    draw_file_list(frame, app, panes[0]);
+    draw_entry_list(frame, app, panes[1]);
+
+    let help = app.message.as_deref().unwrap_or(
+        "Up/Down or j/k select  PageUp/PageDown scroll entries  d delete selected file  r reload  q quit",
+    );
+    frame.render_widget(
+        Paragraph::new(help).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(app.dir.display().to_string()),
+        ),
+        root[1],
+    );
+
+    if app.confirm_delete {
+        draw_delete_confirm(frame, app);
+    }
+}
+
+fn draw_file_list(frame: &mut Frame, app: &TuiApp, area: Rect) {
+    let items = app
+        .files
+        .iter()
+        .map(|file| {
+            let app_name = file
+                .application
+                .as_deref()
+                .or(file.appid.as_deref())
+                .unwrap_or("unknown app");
+            let modified = file.source_modified_utc.as_deref().unwrap_or("");
+            let status = file
+                .parse_error
+                .as_ref()
+                .map(|_| " parse-error")
+                .unwrap_or("");
+            ListItem::new(vec![
+                Line::from(Span::styled(
+                    truncate(app_name, 38),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                Line::from(format!(
+                    "{} entries | {}{}",
+                    file.entry_count,
+                    truncate(modified, 24),
+                    status
+                )),
+                Line::from(truncate(&file.name, 44)),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let mut state = ListState::default();
+    if !app.files.is_empty() {
+        state.select(Some(app.selected));
+    }
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title("Applications"))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_entry_list(frame: &mut Frame, app: &TuiApp, area: Rect) {
+    let selected = app.files.get(app.selected);
+    let title = selected
+        .map(|file| {
+            format!(
+                "Entries - {}",
+                file.application
+                    .as_deref()
+                    .or(file.appid.as_deref())
+                    .unwrap_or("unknown app")
+            )
+        })
+        .unwrap_or_else(|| "Entries".to_string());
+    let lines = if app.entries.is_empty() {
+        vec![Line::from(
+            "No entries, or selected file could not be parsed.",
+        )]
+    } else {
+        app.entries
+            .iter()
+            .flat_map(|entry| {
+                let modified = entry
+                    .destlist_last_modified_utc
+                    .as_deref()
+                    .or(entry.target_modified_utc.as_deref())
+                    .or(entry.source_modified_utc.as_deref())
+                    .unwrap_or("");
+                let target = entry
+                    .target_local_path
+                    .as_deref()
+                    .or(entry.destlist_path.as_deref())
+                    .or(entry.relative_path.as_deref())
+                    .unwrap_or("");
+                let stream = entry.stream_name.as_deref().unwrap_or("");
+                let error = entry
+                    .parse_error
+                    .as_ref()
+                    .map(|err| format!(" | parse: {err}"))
+                    .unwrap_or_default();
+                [
+                    Line::from(Span::styled(
+                        format!("#{stream} {modified}"),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(truncate(target, 120)),
+                    Line::from(format!(
+                        "host: {} | dest: {}{}",
+                        entry.destlist_hostname.as_deref().unwrap_or(""),
+                        entry
+                            .destlist_entry_number
+                            .map(|n| n.to_string())
+                            .unwrap_or_default(),
+                        error
+                    )),
+                    Line::from(""),
+                ]
+            })
+            .collect::<Vec<_>>()
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .scroll((app.entry_scroll, 0))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn draw_delete_confirm(frame: &mut Frame, app: &TuiApp) {
+    let area = centered_rect(62, 22, frame.size());
+    let name = app
+        .files
+        .get(app.selected)
+        .map(|file| file.name.as_str())
+        .unwrap_or("");
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                "Delete selected Jump List file?",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(truncate(name, area.width.saturating_sub(4) as usize)),
+            Line::from(""),
+            Line::from("This removes that application's AutomaticDestinations file."),
+            Line::from("Press y to delete, n or Esc to cancel."),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Confirm Delete"),
+        ),
+        area,
+    );
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+fn list_automatic_files(
+    dir: &Path,
+    app_map: &HashMap<String, String>,
+) -> Result<Vec<JumpListFile>> {
+    let mut files = Vec::new();
+    if !dir.exists() {
+        return Ok(files);
+    }
+    for item in WalkDir::new(dir).min_depth(1).max_depth(1) {
+        let item = item?;
+        let path = item.path();
+        if path
+            .extension()
+            .and_then(OsStr::to_str)
+            .map_or(true, |ext| {
+                !ext.eq_ignore_ascii_case("automaticDestinations-ms")
+            })
+        {
+            continue;
+        }
+        let appid = appid_from_jumplist_name(path);
+        let application = appid.as_ref().and_then(|id| app_map.get(id).cloned());
+        let meta = fs::metadata(path).ok();
+        let parsed = scan_automatic_file(path, appid.clone(), application.clone());
+        let (entry_count, parse_error) = match parsed {
+            Ok(entries) => (entries.len(), None),
+            Err(err) => (0, Some(err.to_string())),
+        };
+        files.push(JumpListFile {
+            path: path.to_path_buf(),
+            name: path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or_default()
+                .to_string(),
+            appid,
+            application,
+            source_modified_utc: meta.and_then(|m| m.modified().ok()).map(system_time_to_utc),
+            entry_count,
+            parse_error,
+        });
+    }
+    files.sort_by(|a, b| {
+        a.application
+            .cmp(&b.application)
+            .then_with(|| a.appid.cmp(&b.appid))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    Ok(files)
 }
 
 fn scan_input(
@@ -189,6 +604,10 @@ fn scan_single_artifact(
 fn default_recent_dir() -> Result<PathBuf> {
     let appdata = env::var_os("APPDATA").context("APPDATA is not set")?;
     Ok(PathBuf::from(appdata).join("Microsoft\\Windows\\Recent"))
+}
+
+fn default_automatic_destinations_dir() -> Result<PathBuf> {
+    Ok(default_recent_dir()?.join("AutomaticDestinations"))
 }
 
 fn scan_plain_recent(recent_dir: &Path) -> Result<Vec<RecentEntry>> {

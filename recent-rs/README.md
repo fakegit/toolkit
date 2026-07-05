@@ -2,7 +2,8 @@
 
 Read-only Windows Recent and Jump List inspector.
 
-This is intended for automation, not interactive GUI use. It scans:
+It can run as an automation-friendly scanner or as a terminal UI for quickly
+inspecting and deleting Automatic Jump List files. It scans:
 
 - `%APPDATA%\Microsoft\Windows\Recent\*.lnk`
 - `%APPDATA%\Microsoft\Windows\Recent\AutomaticDestinations\*.automaticDestinations-ms`
@@ -27,6 +28,8 @@ cargo build --release
 .\target\release\recent-rs.exe scan --dir "$env:APPDATA\Microsoft\Windows\Recent\AutomaticDestinations"
 .\target\release\recent-rs.exe scan --dir ".\1b4dd67f29cb1962.automaticDestinations-ms"
 .\target\release\recent-rs.exe scan --appid-map .\appid-map.csv
+.\target\release\recent-rs.exe tui
+.\target\release\recent-rs.exe tui --dir "$env:APPDATA\Microsoft\Windows\Recent\AutomaticDestinations"
 ```
 
 `appid-map.csv` format:
@@ -35,6 +38,32 @@ cargo build --release
 appid,application
 1b4dd67f29cb1962,Windows Explorer
 ```
+
+## TUI
+
+```powershell
+.\target\release\recent-rs.exe tui
+```
+
+The TUI defaults to:
+
+```text
+%APPDATA%\Microsoft\Windows\Recent\AutomaticDestinations
+```
+
+Keys:
+
+- `Up`/`Down` or `j`/`k`: select an application's Jump List file
+- `PageUp`/`PageDown`: scroll the selected file's entries
+- `d`: delete the selected `.automaticDestinations-ms` file
+- `y`: confirm delete
+- `n` or `Esc`: cancel delete
+- `r`: reload
+- `q`: quit
+
+The "created by" application name is inferred from the Jump List AppID filename.
+Unknown AppIDs are shown as their raw AppID. Add more names with
+`--appid-map .\appid-map.csv`.
 
 ## Notes
 
