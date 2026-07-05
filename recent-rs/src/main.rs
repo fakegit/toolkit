@@ -66,6 +66,9 @@ struct TuiArgs {
 
     #[arg(long, value_name = "CSV")]
     appid_map: Option<PathBuf>,
+
+    #[arg(long)]
+    double_check: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -116,6 +119,7 @@ struct JumpListFile {
 struct TuiApp {
     dir: PathBuf,
     app_map: HashMap<String, String>,
+    double_check_delete: bool,
     files: Vec<JumpListFile>,
     entries: Vec<RecentEntry>,
     selected: usize,
@@ -129,13 +133,15 @@ struct TuiApp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TuiFilter {
     All,
+    NonEmpty,
     ErrorOrEmpty,
 }
 
 impl TuiFilter {
     fn toggle(self) -> Self {
         match self {
-            Self::All => Self::ErrorOrEmpty,
+            Self::All => Self::NonEmpty,
+            Self::NonEmpty => Self::ErrorOrEmpty,
             Self::ErrorOrEmpty => Self::All,
         }
     }
@@ -143,6 +149,7 @@ impl TuiFilter {
     fn label(self) -> &'static str {
         match self {
             Self::All => "All",
+            Self::NonEmpty => "Non-empty",
             Self::ErrorOrEmpty => "Error/Empty",
         }
     }
@@ -150,6 +157,9 @@ impl TuiFilter {
     fn matches(self, file: &JumpListFile) -> bool {
         match self {
             Self::All => true,
+            Self::NonEmpty => {
+                file.entry_count > 0 && file.parse_error.is_none() && file.empty_reason.is_none()
+            }
             Self::ErrorOrEmpty => file.parse_error.is_some() || file.empty_reason.is_some(),
         }
     }
@@ -218,7 +228,7 @@ fn tui(args: TuiArgs) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
 
-    let mut app = TuiApp::new(input, app_map);
+    let mut app = TuiApp::new(input, app_map, args.double_check);
     let run_result = run_tui(&mut terminal, &mut app);
 
     let cleanup_result = disable_raw_mode()
@@ -248,10 +258,11 @@ fn run_tui<B: ratatui::backend::Backend>(
 }
 
 impl TuiApp {
-    fn new(dir: PathBuf, app_map: HashMap<String, String>) -> Self {
+    fn new(dir: PathBuf, app_map: HashMap<String, String>, double_check_delete: bool) -> Self {
         Self {
             dir,
             app_map,
+            double_check_delete,
             files: Vec::new(),
             entries: Vec::new(),
             selected: 0,
@@ -302,7 +313,11 @@ impl TuiApp {
             KeyCode::Char('r') => self.reload()?,
             KeyCode::Char('d') => {
                 if self.selected_file().is_some() {
-                    self.confirm_delete = true;
+                    if self.double_check_delete {
+                        self.confirm_delete = true;
+                    } else {
+                        self.delete_selected()?;
+                    }
                 }
             }
             KeyCode::Char('f') | KeyCode::Char('F') => self.toggle_filter(),
@@ -369,7 +384,12 @@ impl TuiApp {
         }
     }
 
-    fn counts(&self) -> (usize, usize, usize) {
+    fn counts(&self) -> (usize, usize, usize, usize) {
+        let non_empty = self
+            .files
+            .iter()
+            .filter(|file| TuiFilter::NonEmpty.matches(file))
+            .count();
         let errors = self
             .files
             .iter()
@@ -380,7 +400,7 @@ impl TuiApp {
             .iter()
             .filter(|file| file.empty_reason.is_some())
             .count();
-        (self.files.len(), errors, empty)
+        (self.files.len(), non_empty, errors, empty)
     }
 }
 
@@ -411,7 +431,7 @@ fn draw_tui(frame: &mut Frame, app: &TuiApp) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(5),
             Constraint::Min(1),
             Constraint::Length(3),
         ])
@@ -427,7 +447,7 @@ fn draw_tui(frame: &mut Frame, app: &TuiApp) {
     draw_entry_list(frame, app, panes[1]);
 
     let help = app.message.as_deref().unwrap_or(
-        "j/k select  PgUp/PgDn scroll  f filter error/empty  d delete  r reload  q quit",
+        "j/k select  PgUp/PgDn scroll  f filter all/non-empty/error-empty  d delete  r reload  q quit",
     );
     frame.render_widget(
         Paragraph::new(help)
@@ -446,7 +466,7 @@ fn draw_tui(frame: &mut Frame, app: &TuiApp) {
 }
 
 fn draw_header(frame: &mut Frame, app: &TuiApp, area: Rect) {
-    let (total, errors, empty) = app.counts();
+    let (total, non_empty, errors, empty) = app.counts();
     let visible = app.visible_len();
     let lines = vec![
         Line::from(vec![
@@ -458,28 +478,29 @@ fn draw_header(frame: &mut Frame, app: &TuiApp, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                " Automatic Jump Lists ",
+                " Automatic Jump Lists",
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ),
+        ]),
+        Line::from(vec![
             Span::styled(
                 format!("{} shown / {} total", visible, total),
                 Style::default().fg(Color::Gray),
             ),
             Span::raw("  "),
-            Span::styled(format!("ERR {errors}"), Style::default().fg(Color::Red)),
+            Span::styled(format!("OK {non_empty}"), Style::default().fg(Color::Green)),
             Span::raw("  "),
             Span::styled(format!("EMPTY {empty}"), Style::default().fg(Color::Yellow)),
             Span::raw("  "),
-            Span::styled(
-                format!("FILTER {}", app.filter.label()),
-                Style::default().fg(if app.filter == TuiFilter::All {
-                    Color::DarkGray
-                } else {
-                    Color::Cyan
-                }),
-            ),
+            Span::styled(format!("ERR {errors}"), Style::default().fg(Color::Red)),
+            Span::raw("  "),
+            filter_chip("All", app.filter == TuiFilter::All),
+            Span::raw(" "),
+            filter_chip("Non-empty", app.filter == TuiFilter::NonEmpty),
+            Span::raw(" "),
+            filter_chip("Error/Empty", app.filter == TuiFilter::ErrorOrEmpty),
         ]),
         Line::from(Span::styled(
             truncate_display(
@@ -493,6 +514,20 @@ fn draw_header(frame: &mut Frame, app: &TuiApp, area: Rect) {
         Paragraph::new(lines).block(tui_block("Recent Inspector")),
         area,
     );
+}
+
+fn filter_chip(label: &'static str, active: bool) -> Span<'static> {
+    if active {
+        Span::styled(
+            format!(" {label} "),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(format!(" {label} "), Style::default().fg(Color::DarkGray))
+    }
 }
 
 fn draw_file_list(frame: &mut Frame, app: &TuiApp, area: Rect) {
@@ -512,24 +547,23 @@ fn draw_file_list(frame: &mut Frame, app: &TuiApp, area: Rect) {
                 .or(file.appid.as_deref())
                 .unwrap_or("unknown app");
             let modified = file.source_modified_utc.as_deref().unwrap_or("");
-            let count_style = if file.parse_error.is_some() {
-                Style::default().fg(Color::Red)
-            } else if file.empty_reason.is_some() {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::Green)
-            };
-            let status = if file.parse_error.is_some() {
-                (" ERR ", Style::default().fg(Color::Black).bg(Color::Red))
+            let (status, status_style, count_style) = if file.parse_error.is_some() {
+                (
+                    "ERR",
+                    Style::default().fg(Color::Black).bg(Color::Red),
+                    Style::default().fg(Color::Red),
+                )
             } else if file.empty_reason.is_some() {
                 (
-                    " EMPTY ",
+                    "EMPTY",
                     Style::default().fg(Color::Black).bg(Color::Yellow),
+                    Style::default().fg(Color::Yellow),
                 )
             } else {
                 (
-                    " OK ",
-                    Style::default().fg(Color::Black).bg(Color::DarkGray),
+                    "OK",
+                    Style::default().fg(Color::Black).bg(Color::Green),
+                    Style::default().fg(Color::Green),
                 )
             };
             ListItem::new(vec![
@@ -539,15 +573,19 @@ fn draw_file_list(frame: &mut Frame, app: &TuiApp, area: Rect) {
                         Style::default().fg(Color::DarkGray),
                     ),
                     Span::styled(
-                        truncate_display(app_name, inner_width.saturating_sub(4)),
+                        format!(" {status:^5} "),
+                        status_style.add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        truncate_display(app_name, inner_width.saturating_sub(13)),
                         Style::default()
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled(status.0, status.1.add_modifier(Modifier::BOLD)),
-                    Span::raw("  "),
+                    Span::raw("    "),
                     Span::styled(format!("{:>3} entries", file.entry_count), count_style),
                     Span::raw("  "),
                     Span::styled(
@@ -569,6 +607,7 @@ fn draw_file_list(frame: &mut Frame, app: &TuiApp, area: Rect) {
     let title = format!("Applications [{}]", app.filter.label());
     let list = List::new(items)
         .block(tui_block(title).border_style(Style::default().fg(Color::Cyan)))
+        .highlight_symbol(" > ")
         .highlight_style(
             Style::default()
                 .fg(Color::Black)
@@ -642,7 +681,7 @@ fn draw_entry_list(frame: &mut Frame, app: &TuiApp, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
-            Line::from("Press f to return to the full list."),
+            Line::from("Press f to change the filter."),
         ]
     } else if app.entries.is_empty() {
         vec![
@@ -1651,6 +1690,63 @@ mod tests {
         assert_eq!(value, "文档路...");
     }
 
+    #[test]
+    fn tui_filter_matches_non_empty_files() {
+        let ok = test_jump_list_file(3, None, None);
+        let empty = test_jump_list_file(0, Some("empty".to_string()), None);
+        let error = test_jump_list_file(0, None, Some("parse failed".to_string()));
+
+        assert!(TuiFilter::All.matches(&ok));
+        assert!(TuiFilter::All.matches(&empty));
+        assert!(TuiFilter::All.matches(&error));
+
+        assert!(TuiFilter::NonEmpty.matches(&ok));
+        assert!(!TuiFilter::NonEmpty.matches(&empty));
+        assert!(!TuiFilter::NonEmpty.matches(&error));
+
+        assert!(!TuiFilter::ErrorOrEmpty.matches(&ok));
+        assert!(TuiFilter::ErrorOrEmpty.matches(&empty));
+        assert!(TuiFilter::ErrorOrEmpty.matches(&error));
+    }
+
+    #[test]
+    fn delete_key_deletes_immediately_by_default() -> Result<()> {
+        let root = unique_temp_path("delete-default");
+        fs::create_dir_all(&root)?;
+        let path = root.join("test.automaticDestinations-ms");
+        File::create(&path)?;
+
+        let mut app = TuiApp::new(root.clone(), HashMap::new(), false);
+        app.files.push(test_jump_list_file_with_path(path.clone()));
+
+        app.handle_key(KeyCode::Char('d'))?;
+
+        fs::remove_dir_all(&root).ok();
+
+        assert!(!path.exists());
+        assert!(!app.confirm_delete);
+        Ok(())
+    }
+
+    #[test]
+    fn delete_key_prompts_when_double_check_is_enabled() -> Result<()> {
+        let root = unique_temp_path("delete-double-check");
+        fs::create_dir_all(&root)?;
+        let path = root.join("test.automaticDestinations-ms");
+        File::create(&path)?;
+
+        let mut app = TuiApp::new(root.clone(), HashMap::new(), true);
+        app.files.push(test_jump_list_file_with_path(path.clone()));
+
+        app.handle_key(KeyCode::Char('d'))?;
+
+        fs::remove_file(&path).ok();
+        fs::remove_dir_all(&root).ok();
+
+        assert!(app.confirm_delete);
+        Ok(())
+    }
+
     fn destlist_v3(entry_number: u32, hostname: &str, path: &str) -> Vec<u8> {
         let mut data = vec![0u8; 32 + 130];
         data[0..4].copy_from_slice(&3u32.to_le_bytes());
@@ -1685,5 +1781,35 @@ mod tests {
             .expect("system time")
             .as_nanos();
         env::temp_dir().join(format!("recent-rs-test-{nanos}-{name}"))
+    }
+
+    fn test_jump_list_file(
+        entry_count: usize,
+        empty_reason: Option<String>,
+        parse_error: Option<String>,
+    ) -> JumpListFile {
+        JumpListFile {
+            path: PathBuf::from("test.automaticDestinations-ms"),
+            name: "test.automaticDestinations-ms".to_string(),
+            appid: Some("test".to_string()),
+            application: Some("Test".to_string()),
+            source_modified_utc: None,
+            entry_count,
+            empty_reason,
+            parse_error,
+        }
+    }
+
+    fn test_jump_list_file_with_path(path: PathBuf) -> JumpListFile {
+        JumpListFile {
+            path,
+            name: "test.automaticDestinations-ms".to_string(),
+            appid: Some("test".to_string()),
+            application: Some("Test".to_string()),
+            source_modified_utc: None,
+            entry_count: 0,
+            empty_reason: Some("empty".to_string()),
+            parse_error: None,
+        }
     }
 }

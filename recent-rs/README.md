@@ -30,6 +30,7 @@ cargo build --release
 .\target\release\recent-rs.exe scan --appid-map .\appid-map.csv
 .\target\release\recent-rs.exe tui
 .\target\release\recent-rs.exe tui --dir "$env:APPDATA\Microsoft\Windows\Recent\AutomaticDestinations"
+.\target\release\recent-rs.exe tui --double-check
 ```
 
 `appid-map.csv` format:
@@ -55,10 +56,9 @@ Keys:
 
 - `Up`/`Down` or `j`/`k`: select an application's Jump List file
 - `PageUp`/`PageDown`: scroll the selected file's entries
-- `f`: toggle between all Jump List files and only error/empty files
+- `f`: cycle filters: all, non-empty, and error/empty Jump List files
 - `d`: delete the selected `.automaticDestinations-ms` file
-- `y`: confirm delete
-- `n` or `Esc`: cancel delete
+- `--double-check`: require `y` to confirm delete and `n` or `Esc` to cancel
 - `r`: reload
 - `q`: quit
 
